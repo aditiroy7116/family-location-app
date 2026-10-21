@@ -2,6 +2,7 @@ import os
 import time
 import secrets
 from functools import wraps
+import psycopg
 from flask import (
     Flask, request, jsonify, session,
     redirect, url_for, render_template_string
@@ -21,9 +22,29 @@ if not FAMILY_PASSWORD:
         "Set FAMILY_PASSWORD in your terminal before starting the app."
     )
 
-# Temporary storage: locations are cleared when the server restarts.
-locations = {}
+# Locations are stored in PostgreSQL. Old updates expire after 120 seconds.
+DATABASE_URL = os.environ.get("DATABASE_URL")
 LOCATION_MAX_AGE = 120
+
+
+def get_db_connection():
+    """Open a PostgreSQL connection using Render's DATABASE_URL."""
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured.")
+    return psycopg.connect(DATABASE_URL)
+
+
+def ensure_locations_table(conn):
+    """Create the table on first use, without requiring a separate migration."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS family_locations (
+            name TEXT PRIMARY KEY,
+            latitude DOUBLE PRECISION NOT NULL,
+            longitude DOUBLE PRECISION NOT NULL,
+            accuracy DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL
+        )
+    """)
 
 
 def get_csrf_token():
@@ -495,13 +516,27 @@ def update_location():
     if not (0 <= accuracy <= 100000):
         return jsonify({"error": "Invalid accuracy."}), 400
 
-    locations[name] = {
-        "name": name,
-        "latitude": latitude,
-        "longitude": longitude,
-        "accuracy": accuracy,
-        "updated_at": time.time()
-    }
+    updated_at = time.time()
+    try:
+        with get_db_connection() as conn:
+            ensure_locations_table(conn)
+            conn.execute(
+                """
+                INSERT INTO family_locations
+                    (name, latitude, longitude, accuracy, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE SET
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    accuracy = EXCLUDED.accuracy,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (name, latitude, longitude, accuracy, updated_at),
+            )
+    except Exception:
+        app.logger.exception("Could not save location to PostgreSQL.")
+        return jsonify({"error": "Could not save location right now. Please try again."}), 503
+
     session["sharing_name"] = name
     return jsonify({"ok": True})
 
@@ -513,7 +548,16 @@ def delete_location():
     name = str(data.get("name", "")).strip()
 
     if name and name == session.get("sharing_name"):
-        locations.pop(name, None)
+        try:
+            with get_db_connection() as conn:
+                ensure_locations_table(conn)
+                conn.execute(
+                    "DELETE FROM family_locations WHERE name = %s",
+                    (name,),
+                )
+        except Exception:
+            app.logger.exception("Could not delete location from PostgreSQL.")
+            return jsonify({"error": "Sharing stopped on this page, but the last location could not be cleared."}), 503
         session.pop("sharing_name", None)
 
     return jsonify({"ok": True})
@@ -523,17 +567,34 @@ def delete_location():
 @login_required
 def get_locations():
     now = time.time()
-    expired = [
-        name for name, item in locations.items()
-        if now - item["updated_at"] > LOCATION_MAX_AGE
-    ]
-    for name in expired:
-        locations.pop(name, None)
+    try:
+        with get_db_connection() as conn:
+            ensure_locations_table(conn)
+            conn.execute(
+                "DELETE FROM family_locations WHERE updated_at < %s",
+                (now - LOCATION_MAX_AGE,),
+            )
+            rows = conn.execute(
+                """
+                SELECT name, latitude, longitude, accuracy, updated_at
+                FROM family_locations
+                ORDER BY LOWER(name)
+                """
+            ).fetchall()
+    except Exception:
+        app.logger.exception("Could not load locations from PostgreSQL.")
+        return jsonify({"error": "Could not load locations right now. Please try again."}), 503
 
-    return jsonify(sorted(
-        locations.values(),
-        key=lambda item: item["name"].casefold()
-    ))
+    return jsonify([
+        {
+            "name": row[0],
+            "latitude": row[1],
+            "longitude": row[2],
+            "accuracy": row[3],
+            "updated_at": row[4],
+        }
+        for row in rows
+    ])
 
 
 if __name__ == "__main__":
