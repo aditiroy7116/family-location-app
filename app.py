@@ -70,10 +70,12 @@ def login_required(view):
     return wrapped
 
 
+
 @app.before_request
 def protect_requests():
-if request.endpoint in ("login", "static", "android_location") or request.method in ("GET", "HEAD", "OPTIONS"):
+    if request.endpoint in ("login", "static", "android_location") or request.method in ("GET", "HEAD", "OPTIONS"):
         return None
+
 
     if not session.get("logged_in"):
         if request.path.startswith("/api/"):
