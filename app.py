@@ -22,6 +22,14 @@ if not FAMILY_PASSWORD:
         "Set FAMILY_PASSWORD in your terminal before starting the app."
     )
 
+ANDROID_APP_TOKEN = os.environ.get("ANDROID_APP_TOKEN")
+
+if not ANDROID_APP_TOKEN:
+    raise RuntimeError(
+        "Set ANDROID_APP_TOKEN in your environment."
+    )
+   
+
 # Locations are stored in PostgreSQL. Old updates expire after 120 seconds.
 DATABASE_URL = os.environ.get("DATABASE_URL")
 LOCATION_MAX_AGE = 120
@@ -64,7 +72,7 @@ def login_required(view):
 
 @app.before_request
 def protect_requests():
-    if request.endpoint in ("login", "static") or request.method in ("GET", "HEAD", "OPTIONS"):
+if request.endpoint in ("login", "static", "android_location") or request.method in ("GET", "HEAD", "OPTIONS"):
         return None
 
     if not session.get("logged_in"):
@@ -539,6 +547,48 @@ def update_location():
 
     session["sharing_name"] = name
     return jsonify({"ok": True})
+
+@app.route("/api/android/location", methods=["POST", "DELETE"])
+def android_location():
+    supplied_token = request.headers.get("Authorization", "")
+    expected_token = f"Bearer {ANDROID_APP_TOKEN}"
+
+    if not secrets.compare_digest(supplied_token, expected_token):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if request.method == "DELETE":
+        data = request.get_json(silent=True) or {}
+        name = str(data.get("name", "")).strip()
+        if name:
+            locations.pop(name, None)
+        return jsonify({"ok": True})
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+
+    try:
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
+        accuracy = float(data.get("accuracy", 0))
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "Invalid location data."}), 400
+
+    if not name or len(name) > 60:
+        return jsonify({"error": "Enter a valid name."}), 400
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return jsonify({"error": "Coordinates are out of range."}), 400
+    if not (0 <= accuracy <= 100000):
+        return jsonify({"error": "Invalid accuracy."}), 400
+
+    locations[name] = {
+        "name": name,
+        "latitude": latitude,
+        "longitude": longitude,
+        "accuracy": accuracy,
+        "updated_at": time.time()
+    }
+    return jsonify({"ok": True})
+
 
 
 @app.route("/api/location", methods=["DELETE"])
