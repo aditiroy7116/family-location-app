@@ -550,6 +550,7 @@ def update_location():
     session["sharing_name"] = name
     return jsonify({"ok": True})
 
+
 @app.route("/api/android/location", methods=["POST", "DELETE"])
 def android_location():
     supplied_token = request.headers.get("Authorization", "")
@@ -558,39 +559,59 @@ def android_location():
     if not secrets.compare_digest(supplied_token, expected_token):
         return jsonify({"error": "Unauthorized"}), 401
 
-    if request.method == "DELETE":
-        data = request.get_json(silent=True) or {}
-        name = str(data.get("name", "")).strip()
-        if name:
-            locations.pop(name, None)
-        return jsonify({"ok": True})
-
     data = request.get_json(silent=True) or {}
     name = str(data.get("name", "")).strip()
 
-    try:
-        latitude = float(data["latitude"])
-        longitude = float(data["longitude"])
-        accuracy = float(data.get("accuracy", 0))
-    except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "Invalid location data."}), 400
-
     if not name or len(name) > 60:
         return jsonify({"error": "Enter a valid name."}), 400
-    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-        return jsonify({"error": "Coordinates are out of range."}), 400
-    if not (0 <= accuracy <= 100000):
-        return jsonify({"error": "Invalid accuracy."}), 400
 
-    locations[name] = {
-        "name": name,
-        "latitude": latitude,
-        "longitude": longitude,
-        "accuracy": accuracy,
-        "updated_at": time.time()
-    }
+    try:
+        with get_db_connection() as conn:
+            ensure_locations_table(conn)
+
+            if request.method == "DELETE":
+                conn.execute(
+                    "DELETE FROM family_locations WHERE name = %s",
+                    (name,),
+                )
+                return jsonify({"ok": True})
+
+            try:
+                latitude = float(data["latitude"])
+                longitude = float(data["longitude"])
+                accuracy = float(data.get("accuracy", 0))
+            except (KeyError, TypeError, ValueError):
+                return jsonify({"error": "Invalid location data."}), 400
+
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                return jsonify({"error": "Coordinates are out of range."}), 400
+
+            if not (0 <= accuracy <= 100000):
+                return jsonify({"error": "Invalid accuracy."}), 400
+
+            updated_at = time.time()
+
+            conn.execute(
+                """
+                INSERT INTO family_locations
+                    (name, latitude, longitude, accuracy, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE SET
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    accuracy = EXCLUDED.accuracy,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (name, latitude, longitude, accuracy, updated_at),
+            )
+
+    except Exception:
+        app.logger.exception("Android location database operation failed.")
+        return jsonify({
+            "error": "Could not save or delete location right now."
+        }), 503
+
     return jsonify({"ok": True})
-
 
 
 @app.route("/api/location", methods=["DELETE"])
